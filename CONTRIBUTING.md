@@ -68,6 +68,22 @@ uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning --help
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning check benchmarks/kernel_tuning/tasks/gated_residual
 ```
 
+To tune every core operator, generate tasks from the operator catalog and run
+them as one batch (see the
+[generated-task section](docs/proposals/0008-kernel-tuning.md#generated-catalog-tasks-and-batch-tuning)):
+
+```bash
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning generate --list
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --preflight-only --set evaluator_python=/absolute/runtime/python
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --resume results/kernel_tuning/batches/BATCH_ID
+```
+
+Select a subset with operator names or `--model pi05|qwen25-vln|streamvln`. Workloads come
+from the captures in `benchmarks/kernel_tuning/captures/` (recorded by `capture`, optionally
+on a random-weight `skeleton` checkpoint); `--captured FILE` selects another capture and
+`--estimated` uses the catalog's estimates.
+
 Run these commands from the repository root. Humanize2 is pinned to a reviewed
 source revision in the tool's `pyproject.toml`; it drives an existing, separately
 installed coding-agent CLI. Select the harness/model/effort explicitly when

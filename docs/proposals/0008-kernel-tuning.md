@@ -79,6 +79,20 @@ the incumbent and initial baseline. Weights default to equal. Repeat paired
 measurements before promotion. Stop at 20 attempts, two hours of active execution,
 or five consecutive failures/non-improvements; all limits are configurable.
 
+Every timed sample starts from a cold L2 (a 256 MiB buffer is zeroed) with
+freshly copied inputs. CUDA Graph samples queue the flush and the input copy
+ahead of the start event and do not synchronize per sample, so the events bracket
+only the replay's device execution. FlashInfer's `do_bench` synchronizes first;
+its start event then precedes the host launch, adding several microseconds of
+launch latency and scheduler jitter to every sample. On an RTX 5090 that
+inflated microsecond kernels to about 10 µs and let three identical solutions
+differ by up to 53%, far above the 3% promotion threshold. Without it, and with
+1000 iterations (the generated-task default), identical solutions differed by at
+most 4.5% and mostly under 2%. A single trivial kernel replays in about 4.1 µs
+under this protocol, the device's floor; tasks whose baseline is already there
+leave an agent nothing to win, so preflight prints every baseline latency.
+Eager timing still uses FlashInfer's `time_runnable`, including launch cost.
+
 Runs snapshot task files and record source digests, evaluator identity, hardware
 and software fingerprints, precision settings, agent settings, attempts, raw
 measurements, and decisions. Resume requires matching task/tool/environment
@@ -255,3 +269,106 @@ nonce, runtime, and numerical/timing conditions. Use the evaluator Python record
 in the task. The new response's request digest reflects relocated paths. This
 executes evaluation, not agent search. Actual Thor compilation and performance
 are not established by CPU/fake-agent tests.
+
+### Generated catalog tasks and batch tuning
+
+Hand-writing a task package per operator does not scale to every core kernel.
+`scripts/kernel_tuning/operators.py` declares each core Triton operator once:
+its eager Torch reference, the production call used as the baseline, the
+model-derived workload shapes, and the numerical contract. `generate` renders a
+complete task package from an entry. The baseline is the production kernel
+itself: the defining repository module and the repository modules it imports
+are copied byte-for-byte under `vendor/` (absolute `embodiinfer.` imports are
+rewritten to relative ones; package `__init__` files are never copied), and
+`baseline.py` calls it as the engine does. `generated.json` records the
+repository revision and source digests. Structured integer inputs such as
+segment offsets are written as safetensors data inside the task.
+
+The catalog covers the Triton paths of pi0.5 (`ada_rms_norm`, `gated_residual`,
+`gated_gelu`, `rotate_qk`, `split_kv_attention`), the Qwen2.5-VL vision tower of
+the Qwen R2R low-level and panoramic policies (`rotate_half_rope`,
+`segmented_attention`), and StreamVLN's Qwen2 decode path (`rms_norm`,
+`add_rms_norm`, `swiglu`). ActiveVLN runs the Transformers vision tower and an
+eager attention backend, so it currently calls none of these kernels. Workloads
+come from committed captures (see below); the catalog's estimates are only the
+fallback (`--estimated`). All generated tasks time with CUDA Graphs.
+
+Contracts follow the production kernel, not an aspiration. `gated_residual`
+and `rotate_qk` are bit-exact against Torch. The other kernels already round
+differently from eager Torch, so their contract is a tolerance with a stated
+reason: `atol = 2**-10` and `rtol = k * 2**-8`, where `k` counts BF16 roundings
+the production kernel and the eager reference do not share (2 when only the
+final casts differ; 3 for `rms_norm` and `swiglu`; 4 for `gated_gelu` and
+`add_rms_norm`). The `gpu`-marked
+`test_production_baseline_meets_generated_contract` checks every production
+baseline against its contract, including changed-input CUDA Graph replay, and
+prints the fraction of the bound it uses. Every baseline passed on an RTX 4060
+Laptop GPU (Torch 2.6, Triton 3.2; at most 0.85 of its bound) and on an RTX
+5090 (Torch 2.12, Triton 3.7; at most 0.90), and the evaluator preflight passed
+for all ten tasks on both. Re-run both on each target before trusting a
+contract there.
+
+`tune-all` generates the selected operators into a new batch directory under
+`results/kernel_tuning/batches/`, measures every production baseline with the
+evaluator (preflight), and then runs each operator serially in its own
+`run`/`resume` subprocess. A failed operator does not stop the batch; an
+interrupt does, and `tune-all --resume BATCH` continues it, resuming existing
+run archives. Promoted kernels are exported to `exports/<operator>`, and
+`summary.md`/`summary.json` report attempts, promotions, and the improvement
+over the production baseline from the weakest paired round. Machine-specific
+settings (`evaluator_python`, `device`, budgets) are passed with `--set` at
+generation time, and `--hardware-notes` copies target-hardware notes into each
+task as `HARDWARE.md` for the agent.
+
+### Captured workloads
+
+Catalog shapes are estimates. `capture` replaces them with production traffic:
+it runs an unmodified model script in the model's runtime with every catalog
+kernel wrapped, converts each call to the operator's task axes, scalars, and
+fixed integer inputs, and writes one JSONL row per distinct case with its call
+count. Calls outside a task's semantics (another dtype, broadcast tables,
+custom attention scaling) are counted as skipped with the reason. Kernels
+launched while a CUDA Graph is captured are attached to that graph and counted on
+every replay, so production graph configurations can be captured; compilation
+should be disabled. Captures committed under `benchmarks/kernel_tuning/captures/`
+replace the catalog estimates by default, using each operator's most frequent
+cases weighted by call count; `--captured FILE` selects another capture and
+`--estimated` restores the estimates.
+
+Shapes depend on the configuration and the inputs, never on weight values.
+`skeleton REPO --revision REV` therefore builds a random-weight copy of a
+Hugging Face checkpoint: it downloads the small files and synthesizes each
+safetensors file from its header, read with an HTTP range request. Benchmark
+scripts then run unchanged on it, with synthetic frames where the policy resizes
+images to a fixed size anyway. Random weights do not reproduce generated text, so
+decode lengths are fixed in the capture configuration.
+
+`benchmarks/kernel_tuning/captures/pi05-libero10.jsonl` comes from
+`benchmarks/pi05-benchmark` on 200 LIBERO-10 frames (10 tasks), with the
+production Triton paths enabled (`native_inference`, Triton prefix and denoise
+attention). It corrected three estimates. The prefix holds two cameras plus a
+48- or 64-token language bucket (560 or 576 tokens, not 968). `split_kv_attention`
+also runs once per layer over the whole prefix with no cached keys (`P=0`,
+`S=576`). The checkpoint's AdaRMS modulation is BF16, not FP32; the catalog now
+declares BF16 (recalibrated: at most 0.79 of its bound on an RTX 5090). At B=1,
+four of the five pi0.5 kernels measure about 4 µs on an RTX 5090, the device's
+launch floor; only `split_kv_attention` (16-35 µs) leaves room to tune.
+
+The Qwen R2R captures (`qwen-r2r-low.jsonl`, `qwen-r2r-panoramic.jsonl`) use
+skeleton checkpoints and synthetic R2R/RxR episodes (the trajectory release is
+gated; episode lengths follow the benchmark READMEs) with `attention_backend:
+triton` and CUDA Graphs on: only the graph path runs EmbodiInfer's Triton vision
+forward. Each call encodes 4 history frames plus the current one: 1,980 patches
+in 46 ragged windows (low-level) or 7,704 patches in 172 windows (panoramic),
+not the estimated uniform 1,024/4,096. The rotary tables are BF16, which makes
+the production RoPE bit-exact; the catalog now declares both. These shapes put
+`segmented_attention` at 357 µs and 1,405 µs and `rotate_half_rope` at 18 µs and
+61 µs on an RTX 5090. The StreamVLN capture (`streamvln-r2r-rxr.jsonl`, skeleton
+weights, decode capped at the five tokens of its fast action path) sees only
+single-row decode calls: `swiglu` never runs on prefill chunks, and all three
+StreamVLN kernels sit at the launch floor.
+
+```bash
+PYTHONPATH=/path/to/EmbodiInfer /path/to/model-runtime/python -m scripts.kernel_tuning capture   --output pi05.jsonl -- benchmark.py --config capture-config.yaml
+python -m scripts.kernel_tuning tune-all --model pi05 --captured pi05.jsonl --agent ...
+```
